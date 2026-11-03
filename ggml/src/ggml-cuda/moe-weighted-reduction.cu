@@ -4,6 +4,9 @@
 
 static const bool baiinf_parity_reduction = []() {
     const char * value = getenv("BAIINF_PARITY_REDUCTION");
+#if defined(__linux__) && defined(GGML_USE_HIP)
+    if (!value) { return true; }
+#endif
     if (!value || strcmp(value, "0") == 0) { return false; }
     if (strcmp(value, "1") == 0) { return true; }
     GGML_ABORT("BAIINF_PARITY_REDUCTION must be 0 or 1, got '%s'", value);

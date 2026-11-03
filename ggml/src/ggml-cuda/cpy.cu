@@ -423,7 +423,7 @@ static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tens
     spitch = src0->nb[d];
     dpitch = src1->nb[d];
 
-#if defined(GGML_USE_HIP) && defined(USE_CUDA_GRAPH)
+#if defined(GGML_USE_HIP) && defined(USE_CUDA_GRAPH) && defined(__linux__)
     if (src0->type == GGML_TYPE_F32) {
         hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
         CUDA_CHECK(hipStreamIsCapturing(stream, &capture_status));

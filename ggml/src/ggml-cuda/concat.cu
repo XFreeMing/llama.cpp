@@ -7,6 +7,9 @@
 
 static const bool parity_concat_enabled = [] {
     const char * value = std::getenv("BAIINF_PARITY_CONCAT");
+#if defined(__linux__) && defined(GGML_USE_HIP)
+    if (!value) { return true; }
+#endif
     if (!value || std::strcmp(value, "0") == 0) {
         return false;
     }
