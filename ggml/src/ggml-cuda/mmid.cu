@@ -1,6 +1,15 @@
 #include "common.cuh"
 #include "mmid.cuh"
 
+#include <cstring>
+
+static const bool baiinf_parity_ids = []() {
+    const char * value = getenv("BAIINF_PARITY_IDS");
+    if (!value || strcmp(value, "0") == 0) { return false; }
+    if (strcmp(value, "1") == 0) { return true; }
+    GGML_ABORT("BAIINF_PARITY_IDS must be 0 or 1, got '%s'", value);
+}();
+
 // To reduce shared memory use, store "it" and "iex_used" with 22/10 bits each.
 struct mm_ids_helper_store {
     uint32_t data;
@@ -18,6 +27,87 @@ struct mm_ids_helper_store {
     }
 };
 static_assert(sizeof(mm_ids_helper_store) == 4, "unexpected size for mm_ids_helper_store");
+
+#if defined(GGML_USE_HIP)
+__launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mm_ids_helper_4warp(
+        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
+        const int n_tokens, const int nchannels_y, const int si1, const int sis1, const bool write_inverse) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int n_expert_used = 8;
+    const int lane = threadIdx.x % warp_size;
+    const int warp = threadIdx.x / warp_size;
+    const int expert = blockIdx.x;
+    const int n_tokens_warp = (n_tokens + 3) / 4;
+    const int token_begin = warp*n_tokens_warp;
+    const int token_end = min(token_begin + n_tokens_warp, n_tokens);
+
+    extern __shared__ char data_mm_ids_helper_4warp[];
+    mm_ids_helper_store * store = (mm_ids_helper_store *) data_mm_ids_helper_4warp;
+    __shared__ int counts[4];
+    __shared__ int lower[4];
+
+    int nex_prev = 0;
+    int it_compact = 0;
+    for (int it0 = token_begin; it0 < token_end; it0 += warp_size/n_expert_used) {
+        const int it = it0 + lane/n_expert_used;
+        const int iex = lane % n_expert_used;
+        const int expert_used = it < token_end ? ids[it*si1 + iex] : INT_MAX;
+        const int iex_used = expert_used == expert ? iex : -1;
+        nex_prev += expert_used < expert;
+
+        const int add_self = warp_reduce_any<n_expert_used>(iex_used != -1);
+        int add_lower = 0;
+#pragma unroll
+        for (int offset = n_expert_used; offset < warp_size; offset += n_expert_used) {
+            const int tmp = __shfl_up_sync(0xFFFFFFFF, add_self, offset, warp_size);
+            if (lane >= offset) {
+                add_lower += tmp;
+            }
+        }
+        if (iex_used != -1) {
+            store[token_begin + it_compact + add_lower] = mm_ids_helper_store(it, iex_used);
+        }
+        it_compact += __shfl_sync(0xFFFFFFFF, add_lower + add_self, warp_size - 1, warp_size);
+    }
+    nex_prev = warp_reduce_sum<warp_size>(nex_prev);
+    if (lane == 0) {
+        counts[warp] = it_compact;
+        lower[warp] = nex_prev;
+    }
+    __syncthreads();
+
+    int compact_begin = 0;
+    int compact_total = 0;
+    nex_prev = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        nex_prev += lower[i];
+        compact_total += counts[i];
+        if (i < warp) {
+            compact_begin += counts[i];
+        }
+    }
+    for (int itc = lane; itc < it_compact; itc += warp_size) {
+        const mm_ids_helper_store store_it = store[token_begin + itc];
+        const int it = store_it.it();
+        const int iex_used = store_it.iex_used();
+        const int row = nex_prev + compact_begin + itc;
+        ids_dst[row] = it*n_expert_used + iex_used;
+        if (write_inverse) {
+            ids_src1[it*n_expert_used + iex_used] = row;
+        } else {
+            ids_src1[row] = it*sis1 + iex_used % nchannels_y;
+        }
+    }
+    if (threadIdx.x == 0) {
+        expert_bounds[expert] = nex_prev;
+        if (expert == static_cast<int>(gridDim.x) - 1) {
+            expert_bounds[gridDim.x] = nex_prev + compact_total;
+        }
+    }
+}
+#endif
 
 // the generic path passes 0, which needs no padding since it never groups lanes by token
 template <int n> struct mm_ids_pow2 { static constexpr int value = 2*mm_ids_pow2<(n + 1)/2>::value; };
@@ -150,6 +240,19 @@ static void launch_mm_ids_helper(
 void ggml_cuda_launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
+#if defined(GGML_USE_HIP)
+    if (baiinf_parity_ids && n_experts == 256 && n_expert_used == 8 && n_tokens >= 33 && n_tokens <= 1024) {
+        const auto & device = ggml_cuda_info().devices[ggml_cuda_get_device()];
+        const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store);
+        if (device.cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 && nbytes_shared + 8*sizeof(int) <= device.smpb) {
+            mm_ids_helper_4warp<<<n_experts, 4*device.warp_size, nbytes_shared, stream>>>
+                (ids, ids_src1, ids_dst, expert_bounds, n_tokens, nchannels_y, si1, sis1, write_inverse);
+            return;
+        }
+    }
+#else
+    GGML_UNUSED(baiinf_parity_ids);
+#endif
     switch (n_expert_used) {
         case  2:
             launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
