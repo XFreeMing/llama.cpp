@@ -112,6 +112,70 @@ static __global__ void mm_ids_helper_4warp(
 }
 #endif
 
+#if defined(GGML_USE_HIP) && defined(__linux__)
+namespace {
+// A tile contains 32 tokens (256 slots). One bit per lane records a slot's
+// position, so simultaneous inserts preserve the original slot order.
+__global__ void top8_tile_histogram(const int * ids, int * ranks, int * hist, int tokens, int si1) {
+    __shared__ unsigned masks[8][256];
+    const int t = threadIdx.x;
+    const int wave = t / 32;
+    const int lane = t % 32;
+    const int slot = blockIdx.x*256 + t;
+#pragma unroll
+    for (int w = 0; w < 8; ++w) masks[w][t] = 0;
+    __syncthreads();
+    const int expert = slot < tokens*8 ? ids[(slot/8)*si1 + slot%8] : 0;
+    if (slot < tokens*8) atomicOr(&masks[wave][expert], 1u << lane);
+    __syncthreads();
+    unsigned rank = __popc(masks[wave][expert] & ((1u << lane) - 1));
+    unsigned count = 0;
+#pragma unroll
+    for (int w = 0; w < 8; ++w) {
+        if (w < wave) rank += __popc(masks[w][expert]);
+        count += __popc(masks[w][t]);
+    }
+    if (slot < tokens*8) ranks[slot] = rank;
+    hist[blockIdx.x*256 + t] = count;
+}
+
+// A single block scans the 256 expert totals and converts tile counts to offsets.
+__global__ void top8_offsets(int * hist, int * bounds, int tiles, int slots) {
+    __shared__ int totals[256];
+    const int e = threadIdx.x;
+    int total = 0;
+    for (int tile = 0; tile < tiles; ++tile) total += hist[tile*256 + e];
+    totals[e] = total;
+    __syncthreads();
+    for (int step = 1; step < 256; step *= 2) {
+        const int add = e >= step ? totals[e-step] : 0;
+        __syncthreads();
+        totals[e] += add;
+        __syncthreads();
+    }
+    int base = totals[e] - total;
+    bounds[e] = base;
+    if (e == 255) bounds[256] = slots;
+    for (int tile = 0; tile < tiles; ++tile) {
+        const int count = hist[tile*256 + e];
+        hist[tile*256 + e] = base;
+        base += count;
+    }
+}
+
+__global__ void top8_scatter(const int * ids, const int * ranks, const int * hist, int * src, int * dst,
+                             int tokens, int channels, int si1, int sis1, bool inverse) {
+    const int slot = blockIdx.x*256 + threadIdx.x;
+    if (slot >= tokens*8) return;
+    const int token = slot/8, selected = slot%8;
+    const int row = hist[blockIdx.x*256 + ids[token*si1 + selected]] + ranks[slot];
+    dst[row] = slot;
+    if (inverse) src[slot] = row;
+    else src[row] = token*sis1 + selected%channels;
+}
+}
+#endif
+
 // the generic path passes 0, which needs no padding since it never groups lanes by token
 template <int n> struct mm_ids_pow2 { static constexpr int value = 2*mm_ids_pow2<(n + 1)/2>::value; };
 template <>      struct mm_ids_pow2<1> { static constexpr int value = 1; };
@@ -282,4 +346,24 @@ void ggml_cuda_launch_mm_ids_helper(
             launch_mm_ids_helper< 0>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
             break;
     }
+}
+
+void ggml_cuda_group_mmq_ids(ggml_backend_cuda_context & ctx, const int * ids, int * src, int * dst, int * bounds,
+                             int experts, int tokens, int top, int channels, int si1, int sis1, bool inverse, cudaStream_t stream) {
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    if (baiinf_parity_ids && experts == 256 && top == 8 && tokens >= 1025 && tokens <= 2048 &&
+        ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151) {
+        const int tiles = (tokens + 31) / 32;
+        ggml_cuda_pool_alloc<int> scratch(ctx.pool(), tokens * 8 + tiles * 256);
+        int * ranks = scratch.get();
+        int * hist = ranks + tokens * 8;
+        top8_tile_histogram<<<tiles, 256, 0, stream>>>(ids, ranks, hist, tokens, si1);
+        top8_offsets<<<1, 256, 0, stream>>>(hist, bounds, tiles, tokens * 8);
+        top8_scatter<<<tiles, 256, 0, stream>>>(ids, ranks, hist, src, dst, tokens, channels, si1, sis1, inverse);
+        return;
+    }
+#else
+    GGML_UNUSED(ctx);
+#endif
+    ggml_cuda_launch_mm_ids_helper(ids, src, dst, bounds, experts, tokens, top, channels, si1, sis1, inverse, stream);
 }
