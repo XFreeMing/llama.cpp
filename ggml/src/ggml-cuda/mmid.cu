@@ -349,9 +349,9 @@ void ggml_cuda_launch_mm_ids_helper(
 }
 
 void ggml_cuda_group_mmq_ids(ggml_backend_cuda_context & ctx, const int * ids, int * src, int * dst, int * bounds,
-                             int experts, int tokens, int top, int channels, int si1, int sis1, bool inverse, cudaStream_t stream) {
+                             int experts, int tokens, int top, int channels, int si1, int sis1, bool inverse, bool ranked_ids, cudaStream_t stream) {
 #if defined(GGML_USE_HIP) && defined(__linux__)
-    if (baiinf_parity_ids && experts == 256 && top == 8 && tokens >= 1025 && tokens <= 2048 &&
+    if (ranked_ids && baiinf_parity_ids && experts == 256 && top == 8 && tokens >= 1025 && tokens <= 2048 &&
         ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151) {
         const int tiles = (tokens + 31) / 32;
         ggml_cuda_pool_alloc<int> scratch(ctx.pool(), tokens * 8 + tiles * 256);
@@ -363,7 +363,7 @@ void ggml_cuda_group_mmq_ids(ggml_backend_cuda_context & ctx, const int * ids, i
         return;
     }
 #else
-    GGML_UNUSED(ctx);
+    GGML_UNUSED_VARS(ctx, ranked_ids);
 #endif
     ggml_cuda_launch_mm_ids_helper(ids, src, dst, bounds, experts, tokens, top, channels, si1, sis1, inverse, stream);
 }

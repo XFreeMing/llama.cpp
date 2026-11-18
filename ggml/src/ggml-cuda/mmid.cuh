@@ -6,4 +6,4 @@ void ggml_cuda_launch_mm_ids_helper(
 
 struct ggml_backend_cuda_context;
 void ggml_cuda_group_mmq_ids(ggml_backend_cuda_context & ctx, const int * ids, int * src, int * dst, int * bounds,
-                             int experts, int tokens, int top, int channels, int si1, int sis1, bool inverse, cudaStream_t stream);
+                             int experts, int tokens, int top, int channels, int si1, int sis1, bool inverse, bool ranked_ids, cudaStream_t stream);

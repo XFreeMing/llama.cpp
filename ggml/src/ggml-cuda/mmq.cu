@@ -319,6 +319,12 @@ void ggml_cuda_mul_mat_q(
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
+    // An arbitrary MUL_MAT_ID input can contain -1. A prefix of an argsort
+    // over exactly ne02 experts contains only valid, distinct expert indices.
+    const bool ranked_ids = ids->op == GGML_OP_VIEW && ids->view_offs == 0 && ids->src[0] &&
+                            ids->src[0]->op == GGML_OP_ARGSORT && ids->src[0]->ne[0] == ne02 &&
+                            ids->nb[0] == sizeof(int32_t) && ids->nb[1] == ids->src[0]->nb[1];
+
 
     {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
@@ -326,7 +332,7 @@ void ggml_cuda_mul_mat_q(
         const int sis1 = nb12 / nb11;
 
         ggml_cuda_group_mmq_ids(ctx, (const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-                                ne02, ne12, n_expert_used, ne11, si1, sis1, dedup_bcast, stream);
+                                ne02, ne12, n_expert_used, ne11, si1, sis1, dedup_bcast, ranked_ids, stream);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -378,7 +384,7 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12, J_best};
+        ne12, J_best, {}, ranked_ids};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }

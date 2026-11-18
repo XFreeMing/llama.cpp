@@ -1435,6 +1435,7 @@ struct mmq_args {
     int64_t ncols_max;
     int J_best; // Tile width in ne11(dense)/ne12(MoE) direction to use for optimal performance.
     ggml_cuda_mm_fusion_args_device fusion = {}; // gate != nullptr selects the fused gate/up/GLU path
+    bool ranked_ids = false;
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
@@ -1518,7 +1519,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                                       : args.ncols_x == 512 && args.nrows_x == 2048)
             : ((args.ncols_x == 2048 && (args.nrows_x == 512 || args.nrows_x == 4096 || args.nrows_x == 8192)) ||
                ((args.ncols_x == 512 || args.ncols_x == 4096) && args.nrows_x == 2048));
-        if (supported_shape && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 && args.ncols_max >= 1025 && args.ncols_max <= 2048 &&
+        if (supported_shape && (!expert || args.ranked_ids) && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 && args.ncols_max >= 1025 && args.ncols_max <= 2048 &&
             args.nsamples_x == 1 && args.nsamples_y == 1 && args.nchannels_x == (expert ? 256 : 1) &&
             args.nchannels_y == args.nchannels_x && (args.ids_dst != nullptr) == expert &&
             args.ncols_dst == args.ncols_max * (expert ? 8 : 1) && args.ncols_y == args.ncols_dst &&
