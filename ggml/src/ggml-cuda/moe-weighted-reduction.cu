@@ -74,10 +74,15 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
 
     bool columns_first = false;
 #if defined(GGML_USE_HIP)
+#if defined(__linux__)
+    constexpr int64_t max_tokens = 2048;
+#else
+    constexpr int64_t max_tokens = 1024;
+#endif
     columns_first = baiinf_parity_reduction &&
         ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 &&
         experts->ne[0] == 2048 && experts->ne[1] == 8 && experts->ne[2] >= 33 &&
-        experts->ne[2] <= 1024 && experts->ne[3] == 1 &&
+        experts->ne[2] <= max_tokens && experts->ne[3] == 1 &&
         weights->ne[0] == 1 && weights->ne[1] == 8 && weights->ne[2] == experts->ne[2] && weights->ne[3] == 1 &&
         (!expert_scale || ggml_are_same_shape(expert_scale, weights)) &&
         dst->ne[0] == 2048 && dst->ne[1] == experts->ne[2] && dst->ne[2] == 1 && dst->ne[3] == 1;
