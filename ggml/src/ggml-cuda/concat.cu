@@ -55,7 +55,12 @@ static bool try_concat_transposed_prefix(ggml_backend_cuda_context & ctx, ggml_t
     const ggml_tensor * qkv = dst->src[1];
     const ggml_tensor * output = dst;
     const int64_t tokens = qkv->ne[0];
-    if (tokens < 33 || tokens > 1024 || history->ne[0] != 3 || dst->ne[0] != tokens + 3) {
+#if defined(__linux__)
+    constexpr int64_t max_tokens = 4096;
+#else
+    constexpr int64_t max_tokens = 1024;
+#endif
+    if (tokens < 33 || tokens > max_tokens || history->ne[0] != 3 || dst->ne[0] != tokens + 3) {
         return false;
     }
     for (const ggml_tensor * t : { history, qkv, output }) {
