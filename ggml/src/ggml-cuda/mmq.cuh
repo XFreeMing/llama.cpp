@@ -1455,29 +1455,33 @@ static __global__ void mul_mat_q_fixed_k(const char * x, const int * y, const in
 #if defined(__gfx1151__)
     constexpr int I = ggml_cuda_mmq_get_I(type, J, false, GGML_PREC_Q8);
     constexpr int stride = K / ggml_cuda_type_traits<type>::qk;
-    const int col = (expert ? blockIdx.x : blockIdx.y) * J;
-    const int row = (expert ? blockIdx.y : blockIdx.x) * I;
+    constexpr bool striped = expert && type == GGML_TYPE_Q5_K;
     const int e = blockIdx.z;
+    const int row = (expert && !striped ? blockIdx.y : blockIdx.x) * I;
     const int begin = expert ? bounds[e] : 0;
     const int count = expert ? bounds[e + 1] - begin : cols;
-    if (col >= count) {
-        return;
-    }
-
-    extern __shared__ int indices[];
-    const int lane = threadIdx.y * 32 + threadIdx.x;
-    if (lane < J) {
-        // ids has J-1 padding entries, just like the generic MMQ path.
-        indices[lane] = expert ? ids[begin + col + lane] : lane;
-    }
-    __syncthreads();
-
     const int x_offset = (e * rows + row) * stride;
-    const int y_offset = (begin + col) * (sizeof(block_q8_1_mmq) / sizeof(int));
-    const int out_offset = (expert ? 0 : col * rows) + row;
-    mul_mat_q_process_tile<type, J, false, false, GGML_PREC_Q8, false>(
-        x, nullptr, x_offset, y + y_offset, indices, dst + out_offset, nullptr, nullptr, GGML_GLU_OP_SWIGLU, 0.0f,
-        stride, y_rows, rows, rows - row - 1, count - col - 1, 0, stride);
+    const int first_tile = expert && !striped ? blockIdx.x : blockIdx.y;
+    // Two column stripes per expert keep adjacent workgroups on adjacent weight rows.
+    // A hot expert can have more than two tiles. Its workgroups continue in steps of two.
+    for (int col = first_tile * J; col < count; col += gridDim.y * J) {
+        extern __shared__ int indices[];
+        const int lane = threadIdx.y * 32 + threadIdx.x;
+        if (lane < J) {
+            indices[lane] = expert ? ids[begin + col + lane] : lane;
+        }
+        __syncthreads();
+
+        const int y_offset = (begin + col) * (sizeof(block_q8_1_mmq) / sizeof(int));
+        const int out_offset = (expert ? 0 : col * rows) + row;
+        mul_mat_q_process_tile<type, J, false, false, GGML_PREC_Q8, false>(
+            x, nullptr, x_offset, y + y_offset, indices, dst + out_offset, nullptr, nullptr, GGML_GLU_OP_SWIGLU, 0.0f,
+            stride, y_rows, rows, rows - row - 1, count - col - 1, 0, stride);
+        if constexpr (!striped) {
+            return;
+        }
+        __syncthreads(); // All waves must finish reading indices before the next tile.
+    }
 #else
     NO_DEVICE_CODE;
 #endif
@@ -1512,20 +1516,23 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
 #if defined(GGML_USE_HIP) && defined(__linux__)
     if constexpr (!has_fusion && !fallback && prec_src1 == GGML_PREC_Q8 &&
-                  ((type == GGML_TYPE_Q8_0 && J == 128) || ((type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) && J == 64))) {
+                  ((type == GGML_TYPE_Q8_0 && (J == 80 || J == 128)) || (type == GGML_TYPE_Q4_K && J == 64) ||
+                   (type == GGML_TYPE_Q5_K && (J == 32 || J == 64)))) {
         constexpr bool expert = type != GGML_TYPE_Q8_0;
         const bool supported_shape = expert
             ? (type == GGML_TYPE_Q4_K ? args.ncols_x == 2048 && args.nrows_x == 512
                                       : args.ncols_x == 512 && args.nrows_x == 2048)
             : ((args.ncols_x == 2048 && (args.nrows_x == 512 || args.nrows_x == 4096 || args.nrows_x == 8192)) ||
                ((args.ncols_x == 512 || args.ncols_x == 4096) && args.nrows_x == 2048));
-        if (supported_shape && (!expert || args.ranked_ids) && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 && args.ncols_max >= 1025 && args.ncols_max <= 2048 &&
+        constexpr int min_tokens = ((type == GGML_TYPE_Q8_0 && J == 80) || (type == GGML_TYPE_Q5_K && J == 32)) ? 512 : 1025;
+        if (supported_shape && (!expert || args.ranked_ids) && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 && args.ncols_max >= min_tokens && args.ncols_max <= 2048 &&
             args.nsamples_x == 1 && args.nsamples_y == 1 && args.nchannels_x == (expert ? 256 : 1) &&
             args.nchannels_y == args.nchannels_x && (args.ids_dst != nullptr) == expert &&
             args.ncols_dst == args.ncols_max * (expert ? 8 : 1) && args.ncols_y == args.ncols_dst &&
             args.stride_row_x == args.ncols_x / ggml_cuda_type_traits<type>::qk && args.nrows_dst == args.nrows_x &&
             (!expert || args.stride_channel_x == args.nrows_x * args.stride_row_x)) {
-            const dim3 grid = expert ? block_nums_xy_tiling : dim3(nty, ntx, 1);
+            const dim3 grid = type == GGML_TYPE_Q5_K ? dim3(nty, 2, 256) :
+                              expert ? block_nums_xy_tiling : dim3(nty, ntx, 1);
             auto launch = [&](auto k) {
                 mul_mat_q_fixed_k<type, J, decltype(k)::value, expert><<<grid, block_dims, nbytes_shared, stream>>>(
                     args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, args.nrows_x, args.ncols_dst, args.ncols_y);
