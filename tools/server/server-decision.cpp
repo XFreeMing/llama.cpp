@@ -388,10 +388,10 @@ std::vector<server_decision_question> server_decision_context::parse_questions(c
 
 static const size_t DECISION_MAX_IMAGES = 8;
 
-// any media, mtmd tells an audio clip from an image by its content
+// any media, mtmd tells an audio clip or a video from an image by its content
 static void decision_load_image(const json & url, std::vector<raw_buffer> & files) {
     if (!url.is_string() || !string_starts_with(url.get<std::string>(), "data:")) {
-        throw std::invalid_argument("images must be data URLs (data:image/...;base64,... or data:audio/...;base64,...)");
+        throw std::invalid_argument("media must be data URLs (data:image/..., data:audio/... or data:video/...;base64,...)");
     }
     if (files.size() >= DECISION_MAX_IMAGES) {
         throw std::invalid_argument(string_format("too many images, the maximum is %zu", DECISION_MAX_IMAGES));
@@ -457,6 +457,9 @@ json server_decision_context::parse_state(const json & body, std::vector<raw_buf
             } else if (part.is_object() && json_value(part, "type", std::string()) == "input_audio" && part.contains("input_audio")) {
                 const json input_audio = json_value(part, "input_audio", json::object());
                 decision_load_audio(input_audio.contains("data") ? input_audio.at("data") : json_value(input_audio, "url", json()), files);
+            } else if (is_lfm3_d1() && part.is_object() && json_value(part, "type", std::string()) == "video_url" && part.contains("video_url")) {
+                const json & video_url = part.at("video_url");
+                decision_load_image(video_url.is_object() && video_url.contains("url") ? video_url.at("url") : video_url, files);
             } else {
                 content.push_back(part);
             }
@@ -1236,7 +1239,10 @@ void server_decision_context::fill_task(
     if (type == COMMON_DECISION_TYPE_OPENJEV || type == COMMON_DECISION_TYPE_LEV || type == COMMON_DECISION_TYPE_NIMBLE || type == COMMON_DECISION_TYPE_PPLX_DECIDER || type == COMMON_DECISION_TYPE_VLLM_D3 || type == COMMON_DECISION_TYPE_LFM2_D1 ||
         type == COMMON_DECISION_TYPE_H2O_LIGHTNING || type == COMMON_DECISION_TYPE_LFM3_D1 || type == COMMON_DECISION_TYPE_LFM3_D1_OMNI) {
         if (!media.empty()) {
-            task.tokens = process_mtmd_prompt(mctx, prompt, media, init_opt);
+            // the d1 reference sees the frames of a video, not its soundtrack
+            mtmd_helper_init_opt opt = init_opt;
+            opt.video_params.no_soundtrack = is_lfm3_d1();
+            task.tokens = process_mtmd_prompt(mctx, prompt, media, opt);
             return;
         }
     }
@@ -1445,6 +1451,72 @@ void server_decision_context::fill_task_d1omni(
 //
 
 // given to the template: text between the pieces of the prompt, and at the start of the span of a question or of an option
+// lfm3-d1 packs the questions of a state as d1 attention.py pack_set does
+static const std::string D1_HEAD   = "<|startoftext|><|im_start|>user\n";
+static const std::string D1_HEADER = "QUESTION:\n";
+
+size_t server_decision_context::set_size(const std::vector<server_decision_question> & questions) const {
+    if (!is_lfm3_d1()) {
+        return 0;
+    }
+    // TODO: pack spoken questions
+    for (const auto & question : questions) {
+        if (decision_is_spoken(question.instructions)) {
+            return 0;
+        }
+    }
+    return COMMON_DECISION_LFM3_D1_SET_SIZE;
+}
+
+void server_decision_context::fill_task_set(
+        const json & state,
+        const std::vector<server_decision_question> & questions,
+        const std::vector<raw_buffer> & files,
+        mtmd_context * mctx,
+        const mtmd_helper_init_opt & init_opt,
+        server_task & task) const {
+    GGML_ASSERT(!questions.empty());
+
+    std::string head = D1_HEAD;
+    for (size_t i = 0; i < files.size(); i++) {
+        head += get_media_marker();
+    }
+    auto suffix = [&](const server_decision_question & question) {
+        const std::string lone = render(json(), questions, question, 0, files.size());
+        if (!string_starts_with(lone, head)) {
+            throw std::runtime_error("unexpected layout of the decision prompt");
+        }
+        return lone.substr(head.size());
+    };
+
+    // the first question is its lone prompt
+    fill_task(state, questions, questions[0], 0, files, mctx, init_opt, task);
+    const size_t n_first = common_tokenize(vocab, suffix(questions[0]), false, true).size();
+    if (n_first >= task.tokens.size()) {
+        throw std::runtime_error("unexpected layout of the decision prompt");
+    }
+    task.decision.group.assign(task.tokens.size(), 0);
+    std::fill(task.decision.group.end() - n_first, task.decision.group.end(), 1);
+    task.decision.label_pos.assign(task.decision.label_groups.size(), task.tokens.size() - 1);
+
+    for (size_t k = 1; k < questions.size(); k++) {
+        const std::string text = (state.is_null() ? "" : D1_HEADER) + suffix(questions[k]);
+        for (const llama_token token : common_tokenize(vocab, text, false, true)) {
+            task.tokens.push_back(token);
+            task.decision.group.push_back(k + 1);
+        }
+
+        std::vector<std::string>  texts;
+        std::vector<llama_tokens> groups;
+        d1_labels(questions[k], texts, groups);
+        for (const auto & group : groups) {
+            task.decision.labels.insert(task.decision.labels.end(), group.begin(), group.end());
+            task.decision.label_groups.push_back(group.size());
+            task.decision.label_pos.push_back(task.tokens.size() - 1);
+        }
+    }
+}
+
 static const std::string CLEF_MARKER        = "<<clef:";
 static const std::string CLEF_SEP           = "<<clef:sep>>";
 static const std::string CLEF_MARK_QUESTION = "<<clef:question>>";
@@ -1756,7 +1828,7 @@ std::vector<server_task> server_decision_group_tasks(std::vector<server_task> &&
         size_t n_shared = parent.tokens.size() - 1;
         for (size_t j = i + 1; j < end; j++) {
             n_shared = std::min(n_shared, parent.tokens.get_common_prefix(tasks[j].tokens));
-            n_shared = std::min(n_shared, tasks[j].tokens.size() - 1);
+            n_shared = std::min({n_shared, tasks[j].tokens.size() - 1, (size_t) parent.decision.pos_first(), (size_t) tasks[j].decision.pos_first()});
         }
 
         if (end - i < 2 || n_shared == 0) {
