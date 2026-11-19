@@ -82,7 +82,7 @@ static __global__ void mm_ids_helper_4warp(
         int add_lower = 0;
 #pragma unroll
         for (int offset = n_expert_used; offset < warp_size; offset += n_expert_used) {
-            const int tmp = __shfl_up_sync(0xFFFFFFFF, add_self, offset, warp_size);
+            const int tmp = __shfl_up_sync(0xFFFFFFFFULL, add_self, offset, warp_size);
             if (lane >= offset) {
                 add_lower += tmp;
             }
@@ -90,7 +90,7 @@ static __global__ void mm_ids_helper_4warp(
         if (iex_used != -1) {
             store[token_begin + it_compact + add_lower] = mm_ids_helper_store(it, iex_used);
         }
-        it_compact += __shfl_sync(0xFFFFFFFF, add_lower + add_self, warp_size - 1, warp_size);
+        it_compact += __shfl_sync(0xFFFFFFFFULL, add_lower + add_self, warp_size - 1, warp_size);
     }
     nex_prev = warp_reduce_sum<warp_size>(nex_prev);
     if (lane == 0) {
