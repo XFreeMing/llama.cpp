@@ -135,12 +135,6 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
 static int ggml_cuda_mmq_get_J_best(
         const ggml_type type, const int64_t ncols, const bool fallback, const int cc, const size_t smpbo, const ggml_prec prec_src1,
         int * nthreads_best = nullptr) {
-    // An arbitrary MUL_MAT_ID input can contain -1. A prefix of an argsort
-    // over exactly ne02 experts contains only valid, distinct expert indices.
-    const bool ranked_ids = ids && ids->op == GGML_OP_VIEW && ids->view_offs == 0 && ids->src[0] &&
-                            ids->src[0]->op == GGML_OP_ARGSORT && ids->src[0]->ne[0] == ne02 &&
-                            ids->nb[0] == sizeof(int32_t) && ids->nb[1] == ids->src[0]->nb[1];
-
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
@@ -234,6 +228,12 @@ void ggml_cuda_mul_mat_q(
     const bool use_native_fp4 = prec_src1 == GGML_PREC_Q4;
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
+
+    // An arbitrary MUL_MAT_ID input can contain -1. A prefix of an argsort
+    // over exactly ne02 experts contains only valid, distinct expert indices.
+    const bool ranked_ids = ids && ids->op == GGML_OP_VIEW && ids->view_offs == 0 && ids->src[0] &&
+                            ids->src[0]->op == GGML_OP_ARGSORT && ids->src[0]->ne[0] == ne02 &&
+                            ids->nb[0] == sizeof(int32_t) && ids->nb[1] == ids->src[0]->nb[1];
 
     int J_best        = 0;
     int nthreads_best = 0;
