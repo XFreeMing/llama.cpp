@@ -14,3 +14,9 @@ void ggml_cuda_launch_mm_ids_helper(
         int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec,
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int tile_width,
         const int si1, const int sis1, const bool write_inverse, cudaStream_t stream);
+
+struct ggml_backend_cuda_context;
+void ggml_cuda_group_mmq_ids(ggml_backend_cuda_context & ctx, const int * ids, int * src, int * dst,
+                             ggml_cuda_mm_id_tile_spec * spec, int * bounds, int width, int experts,
+                             int tokens, int top, int channels, int si1, int sis1, bool inverse, cudaStream_t stream);
+bool ggml_cuda_parity_ids_enabled();

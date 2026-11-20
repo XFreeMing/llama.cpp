@@ -389,7 +389,7 @@ static void ggml_cpy_f32_iq4_nl_cuda(
 // check if a same-type copy reduces to a 2D strided copy (height rows of width
 // contiguous bytes), so it can use cudaMemcpy2DAsync instead of the scalar kernel
 static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tensor * src1,
-        size_t & width, size_t & height, size_t & spitch, size_t & dpitch) {
+        size_t & width, size_t & height, size_t & spitch, size_t & dpitch, cudaStream_t stream) {
     // require matching shape: a reshaped copy maps elements by flat order, which the
     // prefix walk below does not handle
     if (src0->type != src1->type || !ggml_are_same_shape(src0, src1)) {
@@ -422,6 +422,18 @@ static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tens
     height = src0->ne[d];
     spitch = src0->nb[d];
     dpitch = src1->nb[d];
+
+#if defined(GGML_USE_HIP) && defined(USE_CUDA_GRAPH) && defined(__linux__)
+    if (src0->type == GGML_TYPE_F32) {
+        hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+        CUDA_CHECK(hipStreamIsCapturing(stream, &capture_status));
+        if (capture_status != hipStreamCaptureStatusNone) {
+            return false;
+        }
+    }
+#else
+    GGML_UNUSED(stream);
+#endif
 
     return spitch >= width && dpitch >= width;
 }
@@ -474,7 +486,7 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         {
             CUDA_CHECK(cudaMemcpyAsync(src1_ddc, src0_ddc, ggml_nbytes(src0), cudaMemcpyDeviceToDevice, main_stream));
         }
-    } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
+    } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch, main_stream)) {
         CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
                                      mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
     } else if (src0->type == GGML_TYPE_F8_E4M3 && src1->type == GGML_TYPE_F8_E4M3) {

@@ -244,6 +244,12 @@ void ggml_cuda_mul_mat_q(
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
+    // An arbitrary MUL_MAT_ID input can contain -1. A prefix of an argsort
+    // over exactly ne02 experts contains only valid, distinct expert indices.
+    const bool ranked_ids = ids && ids->op == GGML_OP_VIEW && ids->view_offs == 0 && ids->src[0] &&
+                            ids->src[0]->op == GGML_OP_ARGSORT && ids->src[0]->ne[0] == ne02 &&
+                            ids->nb[0] == sizeof(int32_t) && ids->nb[1] == ids->src[0]->nb[1];
+
     int J_best        = 0;
     int nthreads_best = 0;
     {
@@ -257,6 +263,25 @@ void ggml_cuda_mul_mat_q(
         }
 
         J_best = ggml_cuda_mmq_get_J_best(src0->type, ncols_opt, fallback, cc, smpbo, prec_src1, &nthreads_best);
+#if defined(GGML_USE_HIP) && defined(__linux__)
+        const int64_t tokens = ids ? ne12 : ne11;
+        if (cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 && !fusion && !fallback && prec_src1 == GGML_PREC_Q8 &&
+            tokens >= 512 && tokens <= 2048 && ne03 == 1 && ne13 == 1 && ggml_is_contiguous(src0)) {
+            const bool dense = !ids && src0->type == GGML_TYPE_Q8_0 && ne02 == 1 && ne12 == 1 &&
+                ((ne00 == 2048 && (ne01 == 512 || ne01 == 4096 || ne01 == 8192)) ||
+                 ((ne00 == 512 || ne00 == 4096) && ne01 == 2048));
+            const bool expert = ids && src0->type == GGML_TYPE_Q5_K && ne00 == 512 && ne01 == 2048 &&
+                ne02 == 256 && ids->ne[0] == 8 && ranked_ids;
+            if (dense || expert) {
+                const int tile = dense ? 80 : (tokens <= 1024 ? 32 : 64);
+                const auto config = ggml_cuda_mmq_get_config(src0->type, tile, false, cc, prec_src1);
+                if (mmq_get_nbytes_shared(config, cc) <= smpbo) {
+                    J_best = tile;
+                    nthreads_best = config.nthreads;
+                }
+            }
+        }
+#endif
     }
     GGML_ASSERT(J_best > 0);
 
@@ -325,6 +350,14 @@ void ggml_cuda_mul_mat_q(
     const int ntj = (ne_get_rows + J_best - 1) / J_best + ne02;
     ggml_cuda_pool_alloc<ggml_cuda_mm_id_tile_spec> tile_spec(ctx.pool(), ntj);
 
+    ggml_cuda_pool_alloc<int> bounds(ctx.pool());
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    if (ggml_cuda_parity_ids_enabled() && ranked_ids && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 &&
+        ne02 == 256 && n_expert_used == 8 && ne12 >= 33 && ne12 <= 2048) {
+        bounds.alloc(257);
+    }
+#endif
+
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
@@ -334,8 +367,8 @@ void ggml_cuda_mul_mat_q(
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
 
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), tile_spec.get(),
-            ne02, ne12, n_expert_used, ne11, J_best, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+        ggml_cuda_group_mmq_ids(ctx, (const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), tile_spec.get(), bounds.ptr, J_best,
+            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -387,7 +420,7 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02,    1, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ntj, J_best, fusion_device};
+        ntj, J_best, fusion_device, bounds.ptr};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }

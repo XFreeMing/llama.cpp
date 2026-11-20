@@ -1,6 +1,18 @@
 #include "common.cuh"
 #include "mmid.cuh"
 
+#include <cstring>
+
+static const bool baiinf_parity_ids = []() {
+    const char * value = getenv("BAIINF_PARITY_IDS");
+#if defined(__linux__) && defined(GGML_USE_HIP)
+    if (!value) { return true; }
+#endif
+    if (!value || strcmp(value, "0") == 0) { return false; }
+    if (strcmp(value, "1") == 0) { return true; }
+    GGML_ABORT("BAIINF_PARITY_IDS must be 0 or 1, got '%s'", value);
+}();
+
 // To reduce shared memory use, store "it" and "iex_used" with 22/10 bits each.
 struct mm_ids_helper_store {
     uint32_t data;
@@ -18,6 +30,172 @@ struct mm_ids_helper_store {
     }
 };
 static_assert(sizeof(mm_ids_helper_store) == 4, "unexpected size for mm_ids_helper_store");
+
+static __device__ void write_tile_spec(ggml_cuda_mm_id_tile_spec * tile_spec, int expert,
+        int nex_prev, int it_compact, int slots, uint3 tile_width) {
+    int col_low  = nex_prev;
+    int col_high = nex_prev + min(int(tile_width.z), it_compact);
+
+    // The while loop covers all tiles at the seams containing the column with % tile_width == 0.
+    while (col_high > fastdiv(col_low + tile_width.z - 1, tile_width) * tile_width.z) {
+        tile_spec[fastdiv(col_low + tile_width.z - 1, tile_width)]
+            = {expert, col_low, col_high, /*padding =*/ 0};
+
+        col_low  = col_high;
+        col_high = min(col_high + int(tile_width.z), nex_prev + it_compact);
+    }
+
+    // Finally, at most one extra tile_spec between the seams per expert.
+    tile_spec[fastdiv(slots + tile_width.z - 1, tile_width) + expert]
+        = {expert, col_low, col_high, /*padding =*/ 0};
+}
+
+#if defined(GGML_USE_HIP)
+__launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mm_ids_helper_4warp(
+        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
+        ggml_cuda_mm_id_tile_spec * spec, uint3 width, const int n_tokens, const int nchannels_y, const int si1, const int sis1, const bool write_inverse) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int n_expert_used = 8;
+    const int lane = threadIdx.x % warp_size;
+    const int warp = threadIdx.x / warp_size;
+    const int expert = blockIdx.x;
+    const int n_tokens_warp = (n_tokens + 3) / 4;
+    const int token_begin = warp*n_tokens_warp;
+    const int token_end = min(token_begin + n_tokens_warp, n_tokens);
+
+    extern __shared__ char data_mm_ids_helper_4warp[];
+    mm_ids_helper_store * store = (mm_ids_helper_store *) data_mm_ids_helper_4warp;
+    __shared__ int counts[4];
+    __shared__ int lower[4];
+
+    int nex_prev = 0;
+    int it_compact = 0;
+    for (int it0 = token_begin; it0 < token_end; it0 += warp_size/n_expert_used) {
+        const int it = it0 + lane/n_expert_used;
+        const int iex = lane % n_expert_used;
+        const int expert_used = it < token_end ? ids[it*si1 + iex] : INT_MAX;
+        const int iex_used = expert_used == expert ? iex : -1;
+        nex_prev += expert_used < expert;
+
+        const int add_self = warp_reduce_any<n_expert_used>(iex_used != -1);
+        int add_lower = 0;
+#pragma unroll
+        for (int offset = n_expert_used; offset < warp_size; offset += n_expert_used) {
+            const int tmp = __shfl_up_sync(0xFFFFFFFFULL, add_self, offset, warp_size);
+            if (lane >= offset) {
+                add_lower += tmp;
+            }
+        }
+        if (iex_used != -1) {
+            store[token_begin + it_compact + add_lower] = mm_ids_helper_store(it, iex_used);
+        }
+        it_compact += __shfl_sync(0xFFFFFFFFULL, add_lower + add_self, warp_size - 1, warp_size);
+    }
+    nex_prev = warp_reduce_sum<warp_size>(nex_prev);
+    if (lane == 0) {
+        counts[warp] = it_compact;
+        lower[warp] = nex_prev;
+    }
+    __syncthreads();
+
+    int compact_begin = 0;
+    int compact_total = 0;
+    nex_prev = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        nex_prev += lower[i];
+        compact_total += counts[i];
+        if (i < warp) {
+            compact_begin += counts[i];
+        }
+    }
+    for (int itc = lane; itc < it_compact; itc += warp_size) {
+        const mm_ids_helper_store store_it = store[token_begin + itc];
+        const int it = store_it.it();
+        const int iex_used = store_it.iex_used();
+        const int row = nex_prev + compact_begin + itc;
+        ids_dst[row] = it*n_expert_used + iex_used;
+        if (write_inverse) {
+            ids_src1[it*n_expert_used + iex_used] = row;
+        } else {
+            ids_src1[row] = it*sis1 + iex_used % nchannels_y;
+        }
+    }
+    if (threadIdx.x == 0) {
+        write_tile_spec(spec, expert, nex_prev, compact_total, n_tokens*8, width);
+        expert_bounds[expert] = nex_prev;
+        if (expert == static_cast<int>(gridDim.x) - 1) {
+            expert_bounds[gridDim.x] = nex_prev + compact_total;
+        }
+    }
+}
+#endif
+
+#if defined(GGML_USE_HIP) && defined(__linux__)
+namespace {
+// A tile contains 32 tokens (256 slots). One bit per lane records a slot's
+// position, so simultaneous inserts preserve the original slot order.
+__global__ void top8_tile_histogram(const int * ids, int * ranks, int * hist, int tokens, int si1) {
+    __shared__ unsigned masks[8][256];
+    const int t = threadIdx.x;
+    const int wave = t / 32;
+    const int lane = t % 32;
+    const int slot = blockIdx.x*256 + t;
+#pragma unroll
+    for (int w = 0; w < 8; ++w) masks[w][t] = 0;
+    __syncthreads();
+    const int expert = slot < tokens*8 ? ids[(slot/8)*si1 + slot%8] : 0;
+    if (slot < tokens*8) atomicOr(&masks[wave][expert], 1u << lane);
+    __syncthreads();
+    unsigned rank = __popc(masks[wave][expert] & ((1u << lane) - 1));
+    unsigned count = 0;
+#pragma unroll
+    for (int w = 0; w < 8; ++w) {
+        if (w < wave) rank += __popc(masks[w][expert]);
+        count += __popc(masks[w][t]);
+    }
+    if (slot < tokens*8) ranks[slot] = rank;
+    hist[blockIdx.x*256 + t] = count;
+}
+
+// A single block scans the 256 expert totals and converts tile counts to offsets.
+__global__ void top8_offsets(int * hist, int * bounds, int tiles, int slots, ggml_cuda_mm_id_tile_spec * spec, uint3 width) {
+    __shared__ int totals[256];
+    const int e = threadIdx.x;
+    int total = 0;
+    for (int tile = 0; tile < tiles; ++tile) total += hist[tile*256 + e];
+    totals[e] = total;
+    __syncthreads();
+    for (int step = 1; step < 256; step *= 2) {
+        const int add = e >= step ? totals[e-step] : 0;
+        __syncthreads();
+        totals[e] += add;
+        __syncthreads();
+    }
+    int base = totals[e] - total;
+    write_tile_spec(spec, e, base, total, slots, width);
+    bounds[e] = base;
+    if (e == 255) bounds[256] = slots;
+    for (int tile = 0; tile < tiles; ++tile) {
+        const int count = hist[tile*256 + e];
+        hist[tile*256 + e] = base;
+        base += count;
+    }
+}
+
+__global__ void top8_scatter(const int * ids, const int * ranks, const int * hist, int * src, int * dst,
+                             int tokens, int channels, int si1, int sis1, bool inverse) {
+    const int slot = blockIdx.x*256 + threadIdx.x;
+    if (slot >= tokens*8) return;
+    const int token = slot/8, selected = slot%8;
+    const int row = hist[blockIdx.x*256 + ids[token*si1 + selected]] + ranks[slot];
+    dst[row] = slot;
+    if (inverse) src[slot] = row;
+    else src[row] = token*sis1 + selected%channels;
+}
+}
+#endif
 
 // the generic path passes 0, which needs no padding since it never groups lanes by token
 template <int n> struct mm_ids_pow2 { static constexpr int value = 2*mm_ids_pow2<(n + 1)/2>::value; };
@@ -219,21 +397,7 @@ static __global__ void mm_ids_helper(
         return;
     }
 
-    int col_low  = nex_prev;
-    int col_high = nex_prev + min(int(tile_width.z), n_dumped);
-
-    // The while loop covers all tiles at the seams containing the column with % tile_width == 0.
-    while (col_high > fastdiv(col_low + tile_width.z - 1, tile_width) * tile_width.z) {
-        tile_spec[fastdiv(col_low + tile_width.z - 1, tile_width)]
-            = {expert, col_low, col_high, /*padding =*/ 0};
-
-        col_low  = col_high;
-        col_high = min(col_high + int(tile_width.z), nex_prev + n_dumped);
-    }
-
-    // Finally, at most one extra tile_spec between the seams per expert.
-    tile_spec[fastdiv(n_tokens*n_expert_used + tile_width.z - 1, tile_width) + expert]
-        = {expert, col_low, col_high, /*padding =*/ 0};
+    write_tile_spec(tile_spec, expert, nex_prev, n_dumped, n_tokens*n_expert_used, tile_width);
 }
 
 template <int n_expert_used_template>
@@ -302,3 +466,31 @@ void ggml_cuda_launch_mm_ids_helper(
             break;
     }
 }
+
+void ggml_cuda_group_mmq_ids(ggml_backend_cuda_context & ctx, const int * ids, int * src, int * dst,
+                             ggml_cuda_mm_id_tile_spec * spec, int * bounds, int width, int experts,
+                             int tokens, int top, int channels, int si1, int sis1, bool inverse, cudaStream_t stream) {
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    if (bounds && tokens <= 1024) {
+        const int wave = ggml_cuda_info().devices[ctx.device].warp_size;
+        mm_ids_helper_4warp<<<experts, 4*wave, tokens*sizeof(mm_ids_helper_store), stream>>>(
+            ids, src, dst, bounds, spec, init_fastdiv_values(width), tokens, channels, si1, sis1, inverse);
+        return;
+    }
+    if (bounds) {
+        const int tiles = (tokens + 31) / 32;
+        ggml_cuda_pool_alloc<int> scratch(ctx.pool(), tokens * 8 + tiles * 256);
+        int * ranks = scratch.get();
+        int * hist = ranks + tokens * 8;
+        top8_tile_histogram<<<tiles, 256, 0, stream>>>(ids, ranks, hist, tokens, si1);
+        top8_offsets<<<1, 256, 0, stream>>>(hist, bounds, tiles, tokens * 8, spec, init_fastdiv_values(width));
+        top8_scatter<<<tiles, 256, 0, stream>>>(ids, ranks, hist, src, dst, tokens, channels, si1, sis1, inverse);
+        return;
+    }
+#else
+    GGML_UNUSED_VARS(ctx, bounds);
+#endif
+    ggml_cuda_launch_mm_ids_helper(ids, src, dst, spec, experts, tokens, top, channels, width, si1, sis1, inverse, stream);
+}
+
+bool ggml_cuda_parity_ids_enabled() { return baiinf_parity_ids; }

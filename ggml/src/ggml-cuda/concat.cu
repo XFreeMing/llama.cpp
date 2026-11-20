@@ -1,6 +1,102 @@
 #include "concat.cuh"
 
+#include <cstdlib>
+#include <cstring>
+#include <initializer_list>
 #include <stdint.h>
+
+static const bool parity_concat_enabled = [] {
+    const char * value = std::getenv("BAIINF_PARITY_CONCAT");
+#if defined(__linux__) && defined(GGML_USE_HIP)
+    if (!value) { return true; }
+#endif
+    if (!value || std::strcmp(value, "0") == 0) {
+        return false;
+    }
+    if (std::strcmp(value, "1") == 0) {
+        return true;
+    }
+    GGML_ABORT("BAIINF_PARITY_CONCAT must be 0 or 1");
+}();
+
+#if defined(GGML_USE_HIP)
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
+concat_transposed_prefix_f32(const uint32_t * history, const uint32_t * qkv, uint32_t * dst, const int tokens) {
+    __shared__ uint32_t tile[32][33];
+    const int channel_base = blockIdx.x * 32;
+    const int token_base = blockIdx.y * 32;
+    const int channel = channel_base + threadIdx.x;
+
+    if (blockIdx.y == 0 && threadIdx.y < 3) {
+        dst[channel * (tokens + 3) + threadIdx.y] = history[channel * 3 + threadIdx.y];
+    }
+    for (int j = 0; j < 32; j += 8) {
+        const int token = token_base + threadIdx.y + j;
+        if (token < tokens) {
+            tile[threadIdx.y + j][threadIdx.x] = qkv[token * 8192 + channel];
+        }
+    }
+    __syncthreads();
+
+    const int token = token_base + threadIdx.x;
+    if (token < tokens) {
+        for (int j = 0; j < 32; j += 8) {
+            dst[(channel_base + threadIdx.y + j) * (tokens + 3) + token + 3] = tile[threadIdx.x][threadIdx.y + j];
+        }
+    }
+}
+
+static bool try_concat_transposed_prefix(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int dim) {
+    if (!parity_concat_enabled || dim != 0 || ctx.device != ggml_cuda_get_device() ||
+            ggml_cuda_info().devices[ctx.device].cc != GGML_CUDA_CC_OFFSET_AMD + 0x1151) {
+        return false;
+    }
+    const ggml_tensor * history = dst->src[0];
+    const ggml_tensor * qkv = dst->src[1];
+    const ggml_tensor * output = dst;
+    const int64_t tokens = qkv->ne[0];
+#if defined(__linux__)
+    constexpr int64_t max_tokens = 4096;
+#else
+    constexpr int64_t max_tokens = 1024;
+#endif
+    if (tokens < 33 || tokens > max_tokens || history->ne[0] != 3 || dst->ne[0] != tokens + 3) {
+        return false;
+    }
+    for (const ggml_tensor * t : { history, qkv, output }) {
+        if (t->type != GGML_TYPE_F32 || t->ne[1] != 8192 || t->ne[2] != 1 || t->ne[3] != 1 ||
+                !t->data || !t->buffer || (uintptr_t) t->data % alignof(uint32_t) != 0 ||
+                ggml_backend_buffer_get_type(t->buffer) != ggml_backend_cuda_buffer_type(ctx.device)) {
+            return false;
+        }
+    }
+    for (const ggml_tensor * t : { history, output }) {
+        if (t->nb[0] != sizeof(uint32_t) || t->nb[1] != t->ne[0] * sizeof(uint32_t) ||
+                t->nb[2] != t->nb[1] * 8192 || t->nb[3] != t->nb[2]) {
+            return false;
+        }
+    }
+    if (qkv->nb[0] != 8192 * sizeof(uint32_t) || qkv->nb[1] != sizeof(uint32_t) ||
+            qkv->nb[2] != tokens * qkv->nb[0] || qkv->nb[3] != qkv->nb[2]) {
+        return false;
+    }
+    const auto overlaps = [dst](const ggml_tensor * src) {
+        const uintptr_t out = (uintptr_t) dst->data;
+        const uintptr_t in = (uintptr_t) src->data;
+        return out <= in ? in - out < ggml_nbytes(dst) : out - in < ggml_nbytes(src);
+    };
+    if (overlaps(history) || overlaps(qkv)) {
+        return false;
+    }
+
+    const dim3 blocks(8192 / 32, (tokens + 31) / 32, 1);
+    const dim3 threads(32, 8, 1);
+    concat_transposed_prefix_f32<<<blocks, threads, 0, ctx.stream()>>>(
+        (const uint32_t *) history->data, (const uint32_t *) qkv->data, (uint32_t *) dst->data, (int) tokens);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+#endif
 
 // contiguous kernels
 template <typename T, int dim>
@@ -203,6 +299,12 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     GGML_ASSERT(src0->type == src1->type);
     GGML_ASSERT(dst->type  == src0->type);
+
+#if defined(GGML_USE_HIP)
+    if (try_concat_transposed_prefix(ctx, dst, dim)) {
+        return;
+    }
+#endif
 
     if (ggml_is_quantized(src0->type)) {
         if (dim == 3) {
